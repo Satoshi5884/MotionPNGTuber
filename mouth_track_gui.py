@@ -335,6 +335,15 @@ class App(tk.Tk):
         self.audio_device_var = tk.IntVar(value=int(sess.get("audio_device", 31)))
         self.audio_device_menu_var = tk.StringVar(value="")
 
+        # GPU/CPU device for preprocessing (tracking/face detection)
+        _gpu_dev = sess.get("gpu_device", "auto")
+        if _gpu_dev not in ["cpu", "auto", "cuda:0", "cuda:1"]:
+            _gpu_dev = "auto"
+        self.gpu_device_var = tk.StringVar(value=_gpu_dev)
+
+        # Audio file for runtime (optional: use audio file instead of realtime input)
+        self.audio_file_var = tk.StringVar(value=sess.get("audio_file", ""))
+
         self._build_ui()
 
         self._refresh_characters(init=True)
@@ -433,6 +442,31 @@ class App(tk.Tk):
             "<<ComboboxSelected>>",
             lambda _evt=None: save_session({"smoothing": self.smoothing_menu_var.get()}),
         )
+        # GPU/CPU device row (preprocessing: tracking/face detection)
+        row3c = ttk.Frame(frm)
+        row3c.pack(fill="x", pady=(0, 8))
+        ttk.Label(row3c, text="GPU/CPUデバイス（解析用）").pack(side="left")
+        self.cmb_gpu_device = ttk.Combobox(
+            row3c,
+            textvariable=self.gpu_device_var,
+            state="readonly",
+            values=["auto", "cpu", "cuda:0", "cuda:1"],
+        )
+        self.cmb_gpu_device.pack(side="left", fill="x", expand=True, padx=8)
+        self.cmb_gpu_device.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt=None: save_session({"gpu_device": self.gpu_device_var.get()}),
+        )
+        ttk.Label(row3c, text="（RTX 5060 TiなどはCPUを選択）").pack(side="left")
+
+        # Audio file row (runtime - optional)
+        row3d = ttk.Frame(frm)
+        row3d.pack(fill="x", pady=(0, 8))
+        ttk.Label(row3d, text="音声ファイル（任意）").pack(side="left")
+        ttk.Entry(row3d, textvariable=self.audio_file_var).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(row3d, text="選択…", command=self.on_pick_audio_file).pack(side="left", padx=(0, 4))
+        ttk.Button(row3d, text="クリア", command=lambda: self.audio_file_var.set("")).pack(side="left")
+
         # Audio device row (runtime)
         row4 = ttk.Frame(frm)
         row4.pack(fill="x", pady=(0, 10))
@@ -699,6 +733,16 @@ class App(tk.Tk):
             "emotion_hud": bool(self.emotion_hud_var.get()),
         })
 
+    def on_pick_audio_file(self) -> None:
+        p = filedialog.askopenfilename(
+            title="音声ファイルを選択",
+            filetypes=[("Audio", "*.wav;*.mp3;*.flac;*.ogg;*.m4a"), ("All", "*.*")],
+        )
+        if not p:
+            return
+        self.audio_file_var.set(p)
+        save_session({"audio_file": p})
+
     def on_stop(self) -> None:
         self.stop_flag.set()
         self.log("[gui] stop requested. force-stopping active process (if any).")
@@ -903,6 +947,7 @@ class App(tk.Tk):
                     "--min-conf", "0.5",
                     "--early-stop",
                     "--max-tries", "4",
+                    "--device", self.gpu_device_var.get(),
                 ]
                 # Apply smoothing preset from GUI (Auto = pass nothing)
                 _cutoff = SMOOTHING_PRESETS.get(self.smoothing_menu_var.get())
@@ -1331,8 +1376,10 @@ class App(tk.Tk):
                 mouth_dir = resolve_character_dir(mouth_root, char)
 
                 device_idx = int(self.audio_device_var.get())
+                audio_file = self.audio_file_var.get().strip()
                 save_session({
                     "audio_device": device_idx,
+                    "audio_file": audio_file,
                     "character": char,
                     "emotion_preset": self.emotion_preset_var.get(),
                     "emotion_hud": bool(self.emotion_hud_var.get()),
@@ -1353,6 +1400,11 @@ class App(tk.Tk):
                     "--track-calibrated", calib_npz,
                     "--device", str(device_idx),
                 ]
+
+                # Add audio file if specified
+                if audio_file and os.path.isfile(audio_file):
+                    cmd += ["--audio-file", audio_file]
+                    self.log(f"[audio] using file: {audio_file}")
 
                 # Disable manual emotion GUI (AUTO-only)
                 if self._runtime_supports(runtime_py, ["--no-emotion-gui"]):

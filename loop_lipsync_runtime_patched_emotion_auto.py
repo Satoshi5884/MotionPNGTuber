@@ -46,6 +46,13 @@ except Exception:
 import sounddevice as sd
 from PIL import Image
 
+# For audio file input
+try:
+    import soundfile as sf
+    HAS_SOUNDFILE = True
+except ImportError:
+    HAS_SOUNDFILE = False
+
 HERE = os.path.abspath(os.path.dirname(__file__))
 LAST_SESSION_FILE = os.path.join(HERE, ".mouth_track_last_session.json")
 __VERSION__ = "v6-emotion-auto"
@@ -818,10 +825,25 @@ def run(args) -> None:
             full_w, full_h = 1440, 2560
             print(f"[warn] could not probe video size, using default: {full_w}x{full_h}")
 
-    # ---- audio device ----
+    # ---- audio device or file ----
     samplerate = 48000
     input_channels = 1
-    if args.device is not None:
+    audio_file_mode = False
+    audio_file_data = None
+    audio_file_sr = 48000
+    audio_file_pos = 0
+
+    if args.audio_file and os.path.isfile(args.audio_file):
+        if not HAS_SOUNDFILE:
+            raise RuntimeError("音声ファイル入力には soundfile が必要です: pip install soundfile")
+        audio_file_mode = True
+        audio_file_data, audio_file_sr = sf.read(args.audio_file, dtype='float32')
+        # Ensure mono
+        if audio_file_data.ndim == 2:
+            audio_file_data = audio_file_data.mean(axis=1)
+        samplerate = int(audio_file_sr)
+        print(f"[audio] using file: {args.audio_file}, sr={samplerate}, duration={len(audio_file_data)/samplerate:.2f}s")
+    elif args.device is not None:
         dev = sd.query_devices(args.device, "input")
         samplerate = int(dev["default_samplerate"])
         max_in = int(dev.get("max_input_channels", 1) or 1)
@@ -1039,15 +1061,18 @@ def run(args) -> None:
             except queue.Full:
                 pass
 
-    stream = sd.InputStream(
-        samplerate=samplerate,
-        channels=input_channels,
-        blocksize=hop,
-        dtype="float32",
-        callback=audio_cb,
-        device=args.device,
-        latency="low",
-    )
+    # Create stream only for realtime mode
+    stream = None
+    if not audio_file_mode:
+        stream = sd.InputStream(
+            samplerate=samplerate,
+            channels=input_channels,
+            blocksize=hop,
+            dtype="float32",
+            callback=audio_cb,
+            device=args.device,
+            latency="low",
+        )
 
     # ---- audio state ----
     beta = one_pole_beta(args.cutoff_hz, args.audio_hz)
@@ -1081,7 +1106,10 @@ def run(args) -> None:
     window_name = args.window_name
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     print("[info] Press 'q' to quit.")
-    print("stream latency:", stream.latency)
+    if stream is not None:
+        print("stream latency:", stream.latency)
+    else:
+        print("[audio] file mode: no stream latency")
 
     def draw_one(dst_rgb: np.ndarray, frame_idx: int, track: MouthTrack | None, scale: float):
         nonlocal mouth_shape_now
@@ -1101,11 +1129,60 @@ def run(args) -> None:
                 q = quad.astype(np.int32).reshape(4, 2)
                 cv2.polylines(dst_rgb, [q], isClosed=True, color=(0, 255, 0), thickness=2)
 
-    with stream:
+    # Main loop with stream context (or without for file mode)
+    def run_main_loop():
+        nonlocal audio_file_pos, emo_buf, e_prev2, e_prev1, mouth_shape_now, current_open_shape
+        nonlocal last_vowel_change_t, noise, peak, env_lp, rendered, last_stat, current_emotion, mouth, hud_root, hud_lbl
         next_frame_t = time.perf_counter()
         while True:
             now = time.perf_counter()
             t = now - t0
+
+            # ---- audio file mode: manually read chunks ----
+            if audio_file_mode and audio_file_data is not None:
+                # Read audio chunks at the same rate as realtime (audio_hz)
+                while audio_file_pos < len(audio_file_data):
+                    chunk_size = hop
+                    if audio_file_pos + chunk_size > len(audio_file_data):
+                        # Pad last chunk
+                        chunk = np.zeros(chunk_size, dtype=np.float32)
+                        remaining = len(audio_file_data) - audio_file_pos
+                        chunk[:remaining] = audio_file_data[audio_file_pos:audio_file_pos + remaining]
+                        audio_file_pos = len(audio_file_data)
+                    else:
+                        chunk = audio_file_data[audio_file_pos:audio_file_pos + chunk_size]
+                        audio_file_pos += chunk_size
+
+                    # Process chunk (same as audio_cb)
+                    x = chunk.astype(np.float32)
+                    if len(x) < hop:
+                        x = np.pad(x, (0, hop - len(x)))
+                    elif len(x) > hop:
+                        x = x[:hop]
+                    rms_raw = float(np.sqrt(np.mean(x * x) + 1e-12))
+                    w = x * window
+                    mag = np.abs(np.fft.rfft(w)) + 1e-9
+                    centroid = float((freqs * mag).sum() / mag.sum())
+                    centroid = float(np.clip(centroid / (samplerate * 0.5), 0.0, 1.0))
+                    try:
+                        feat_q.put_nowait((rms_raw, centroid))
+                    except queue.Full:
+                        pass
+
+                    # Emotion-auto
+                    if emotion_auto_enabled and (emo_audio_q is not None):
+                        try:
+                            emo_audio_q.put_nowait(x)
+                        except queue.Full:
+                            pass
+
+                    # Only process one chunk per frame
+                    break
+
+                # End playback when audio file ends
+                if audio_file_pos >= len(audio_file_data):
+                    print("[audio] file playback completed")
+                    return
 
             # ---- emotion GUI updates ----
             # Avoid raising queue.Empty every frame when no GUI input is present.
@@ -1309,6 +1386,14 @@ def run(args) -> None:
                 last_stat = now2
                 print(f"[runtime] fps:{fps:.2f} mouth:{mouth_shape_now} frame:{vid_prev.frame_idx}")
 
+    # Call main loop with stream context (or without for file mode)
+    if stream is not None:
+        with stream:
+            run_main_loop()
+    else:
+        run_main_loop()
+
+    # Cleanup
     if cam is not None:
         cam.close()
     vid_prev.close()
@@ -1354,6 +1439,7 @@ def parse_args():
     ap.add_argument("--cutoff-hz", type=float, default=8.0)
 
     ap.add_argument("--device", type=int, default=31, help="sounddevice input device index")
+    ap.add_argument("--audio-file", default="", help="音声ファイルから入力（リアルタイムではなく録音データを使用）")
     ap.add_argument("--use-virtual-cam", action="store_true")
 
     ap.add_argument("--mouth-fixed-x", type=int, default=int(1440 * 0.50))
